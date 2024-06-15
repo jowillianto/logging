@@ -1,0 +1,292 @@
+module;
+#include <format>
+#include <string>
+#include <string_view>
+#include <source_location>
+#include <algorithm>
+export module moderna.logging:format_override;
+import :context;
+
+/*
+  Formatter specialization for source_location.
+  Usage :
+  "{:%F_%c_%l_%f}"
+  where :
+  F -> file Name
+  f -> function name
+  l -> line number
+  c -> column number
+*/
+template <> struct std::formatter<std::source_location> {
+  static constexpr std::string_view valid_ids{"lcfF"};
+  constexpr auto parse(std::format_parse_context &ctx) {
+    auto full_format_string = std::string_view{ctx.begin(), ctx.end()};
+    auto end_pos = full_format_string.find('}');
+    if (end_pos == std::string::npos) end_pos = full_format_string.size();
+    auto format_string = std::string_view{ctx.begin(), ctx.begin() + end_pos};
+    if (format_string.size() == 0) {
+      _location_format = "%F:%f:%l";
+      return format_string.end();
+    }
+    bool is_in_percent = false;
+    for (auto i = format_string.begin(); i != format_string.end(); i += 1) {
+      if (*i == '%') is_in_percent = true;
+      else if (is_in_percent && valid_ids.find(*i) == std::string::npos) {
+        throw std::format_error{
+          std::format("'{}' is not a valid identifier. Valid Ids : '{}'", *i, valid_ids)
+        };
+      } else {
+        is_in_percent = false;
+      }
+    }
+    _location_format = format_string;
+    return _location_format.end();
+  }
+  template <typename FormatContext>
+  auto format(const std::source_location &loc, FormatContext &ctx) const {
+    auto beg = 0;
+    while (beg != _location_format.size()) {
+      auto percent_pos = _location_format.find('%', beg);
+      if (percent_pos == std::string::npos)
+        return std::format_to(
+          ctx.out(), "{}", std::string_view{_location_format.begin() + beg, _location_format.end()}
+        );
+      else {
+        // Format text not in the % range. 
+        std::format_to(
+          ctx.out(),
+          "{}",
+          std::string_view{_location_format.begin() + beg, _location_format.begin() + percent_pos}
+        );
+        // Format in percent range.
+        switch (_location_format[percent_pos + 1]) {
+          case 'l':
+            std::format_to(ctx.out(), "{}", loc.line());
+            break;
+          case 'c':
+            std::format_to(ctx.out(), "{}", loc.column());
+            break;
+          case 'f':
+            std::format_to(ctx.out(), "{}", loc.function_name());
+            break;
+          case 'F':
+            // std::format_to(ctx.out(), "{}", loc.file_name());
+            std::string_view f { loc.file_name() };
+            auto slash_pos = f.rfind('/');
+            if (slash_pos != std::string::npos)
+              std::format_to(ctx.out(), "{}", std::string_view{f.begin() + slash_pos + 1, f.end()});
+            else
+              std::format_to(ctx.out(), "{}", f);
+            break;
+        }
+      }
+      beg = percent_pos + 2;
+    }
+    // bool is_in_percent = false;
+
+    // for (auto i = _location_format.begin(); i != _location_format.end(); i += 1) {
+    //   if
+    //     if (*i == '%') is_in_percent = true;
+    //     else if (is_in_percent && *i == 'l') {
+    //       std::format_to(ctx.out(), "{}", loc.line());
+    //       is_in_percent = false;
+    //     } else if (is_in_percent && *i == 'c') {
+    //       std::format_to(ctx.out(), "{}", loc.column());
+    //       is_in_percent = false;
+    //     } else if (is_in_percent && *i == 'f') {
+    //       std::string_view file_name = loc.file_name() == nullptr ? "no_file" : loc.file_name();
+    //       auto pos = file_name.rfind('/');
+    //       if (pos != std::string_view::npos) {
+    //         std::format_to(
+    //           ctx.out(), "{}", std::string_view{file_name.begin() + pos + 1, file_name.end()}
+    //         );
+    //       } else {
+    //         std::format_to(ctx.out(), "{}", file_name);
+    //       }
+    //       is_in_percent = false;
+    //     } else if (is_in_percent && *i == 'F') {
+    //       std::format_to(
+    //         ctx.out(), "{}", loc.function_name() == nullptr ? "no_func" : loc.function_name()
+    //       );
+    //       is_in_percent = false;
+    //     } else if (is_in_percent) {
+    //       std::format_to(ctx.out(), "%{}", *i);
+    //       is_in_percent = false;
+    //     } else {
+    //       auto next_i = std::ranges::find(i, _location_format.end(), '%');
+    //       std::format_to(ctx.out(), "{}", std::string_view{i, next_i});
+    //       i = next_i - 1;
+    //     }
+    // }
+    return ctx.out();
+  }
+
+private:
+  std::string_view _location_format;
+};
+
+/*
+  Formatter specialization for Logging Level.
+  Specifies the following :
+  M -> Message
+  L -> Level
+  T -> Thread
+  t -> Time
+  S -> Source Location
+  And followed by each of the identifier is a [ ] brackets coded formatting for the messaging.
+  This does not support nesting.
+  Example :
+  {:[%L] [%S[Line=%l, File=%F, Func=%f] [Time [%F %H:%M:%S] ] ]}
+
+  Notes :
+  Only the first occurence of each will be substituted. Subsequent occurences will be ignored.
+*/
+template <moderna::logging::Level log_level>
+struct std::formatter<moderna::logging::Context<log_level>> {
+  static constexpr std::string_view valid_ids{"MLTtS"};
+  static constexpr std::string_view default_time_format{"%F %H:%M:%S"};
+  static constexpr std::string_view default_loc_format{"%F:%f:%l"};
+
+  constexpr void parse_time(std::string_view full_format_string) {
+    auto t_pos = full_format_string.find("%t");
+    if (t_pos != std::string::npos) {
+      _time_section.start = t_pos;
+      std::string_view s{full_format_string.begin() + t_pos + 2, full_format_string.end()};
+      if (s.starts_with('[')) {
+        auto e_pos = s.find(']');
+        if (e_pos == std::string::npos)
+          throw std::format_error{std::format("'{}' has to have an end by ]", s)};
+        auto time_ctx =
+          std::basic_format_parse_context{std::string_view{s.begin() + 1, s.begin() + e_pos}};
+        _time_format.parse(time_ctx);
+        _time_section.size = e_pos + 1;
+      } else {
+        auto default_ctx = std::basic_format_parse_context{default_time_format};
+        _time_format.parse(default_ctx);
+        _time_section.size = 0;
+      }
+    }
+  }
+  constexpr void parse_loc(std::string_view full_format_string) {
+    auto s_pos = full_format_string.find("%S");
+    if (s_pos != std::string::npos) {
+      _loc_section.start = s_pos;
+      std::string_view s{full_format_string.begin() + s_pos + 2, full_format_string.end()};
+      if (s.starts_with('[')) {
+        auto e_pos = s.find(']');
+        if (e_pos == std::string::npos)
+          throw std::format_error{std::format("'{}' has to have an end by ]", s)};
+        auto loc_ctx =
+          std::basic_format_parse_context{std::string_view{s.begin() + 1, s.begin() + e_pos}};
+        _loc_format.parse(loc_ctx);
+        _loc_section.size = e_pos + 1;
+      } else {
+        auto default_ctx = std::basic_format_parse_context{default_loc_format};
+        _loc_format.parse(default_ctx);
+        _loc_section.size = 0;
+      }
+    }
+  }
+  constexpr auto parse(std::format_parse_context &ctx) {
+    auto full_format_string = std::string_view{ctx.begin(), ctx.end()};
+    auto end_pos = full_format_string.find('}');
+    if (end_pos == std::string::npos)
+      // throw std::format_error{std::format("'{}' has to end with '}}'", full_format_string)};
+      end_pos = full_format_string.size();
+    auto format_string = std::string_view{ctx.begin(), ctx.begin() + end_pos};
+    if (format_string.size() == 0) {
+      format_string = "[%L] [%t] [%S] %M";
+    }
+    parse_time(format_string);
+    parse_loc(format_string);
+    bool is_in_percent = false;
+    for (auto i = _format_string.begin(); i < _format_string.end(); i += 1) {
+      bool is_in_percent = false;
+      for (auto i = format_string.begin(); i != format_string.end(); i += 1) {
+        if (*i == '%') is_in_percent = true;
+        else if (is_in_percent && valid_ids.find(*i) == std::string::npos) {
+          if (*i == 'S') {
+            i += _loc_section.size;
+          } else if (*i == 't') {
+            i += _time_section.size;
+          }
+          throw std::format_error{
+            std::format("'{}' is not a valid identifier. Valid Ids : '{}'", *i, valid_ids)
+          };
+        } else {
+          is_in_percent = false;
+        }
+      }
+    }
+    _format_string = format_string;
+    return format_string.end();
+  }
+  template <typename FormatContext>
+  auto format(const moderna::logging::Context<log_level> &context, FormatContext &ctx) const {
+    bool inside_percent = false;
+    for (auto i = _format_string.begin(); i < _format_string.end(); i += 1) {
+      if (*i == '%') {
+        inside_percent = true;
+      } else if (inside_percent && *i == 'M') {
+        std::format_to(ctx.out(), "{}", context.message());
+        inside_percent = false;
+      } else if (inside_percent && *i == 'T') {
+        std::format_to(ctx.out(), "{}", context.thread_id());
+        inside_percent = false;
+      } else if (inside_percent && *i == 'L') {
+        std::format_to(ctx.out(), "{}", context.level());
+        inside_percent = false;
+      } else if (inside_percent && *i == 't') {
+        _time_format.format(context.call_time(), ctx);
+        i += _time_section.size;
+        inside_percent = false;
+      } else if (inside_percent && *i == 'S') {
+        _loc_format.format(context.call_location(), ctx);
+        i += _loc_section.size;
+        inside_percent = false;
+      } else if (inside_percent) {
+        std::format_to(ctx.out(), "%{}", *i);
+        inside_percent = false;
+      } else {
+        auto next_i = std::ranges::find(i, _format_string.end(), '%');
+        std::format_to(ctx.out(), "{}", std::string_view{i, next_i});
+        i = next_i - 1;
+      }
+    }
+    return ctx.out();
+  }
+
+private:
+  struct FormatSection {
+    size_t start = std::string::npos;
+    size_t size = std::string::npos;
+    bool is_valid() const {
+      return start == std::string::npos && size == std::string::npos;
+    }
+  };
+  std::string_view _format_string;
+  std::formatter<std::chrono::system_clock::time_point> _time_format;
+  FormatSection _time_section;
+  std::formatter<std::source_location> _loc_format;
+  FormatSection _loc_section;
+};
+template <> struct std::formatter<moderna::logging::Level> {
+  constexpr auto parse(std::format_parse_context &ctx) {
+    return ctx.begin();
+  }
+  template <typename FormatContext>
+  auto format(const moderna::logging::Level &log_level, FormatContext &ctx) const {
+    switch (log_level) {
+      case moderna::logging::Level::DEBUG:
+        return std::format_to(ctx.out(), "DEBUG");
+      case moderna::logging::Level::INFO:
+        return std::format_to(ctx.out(), "INFO");
+      case moderna::logging::Level::WARNING:
+        return std::format_to(ctx.out(), "WARN");
+      case moderna::logging::Level::ERROR:
+        return std::format_to(ctx.out(), "ERROR");
+      case moderna::logging::Level::FATAL:
+        return std::format_to(ctx.out(), "FATAL");
+    }
+  }
+};

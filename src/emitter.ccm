@@ -1,0 +1,152 @@
+module;
+#include <filesystem>
+#include <iostream>
+#include <mutex>
+#include <system_error>
+#include <tuple>
+export module moderna.logging:emitter;
+import :context;
+
+namespace moderna::logging {
+  export template <typename E, Level log_level>
+  concept SingleLevelEmitter = requires(E e) {
+    { e.template emit<log_level>(std::declval<std::string_view>()) };
+    { e.template emit<log_level>(std::declval<std::string>()) };
+  } && std::is_move_constructible_v<E>;
+  /*
+    Checks if Emitter will emit DEBUG messages
+  */
+  export template <typename E>
+  concept DebugEmitter = SingleLevelEmitter<E, Level::DEBUG>;
+
+  /*
+    Checks if Emitter will emit INFO messages
+*/
+  export template <typename E>
+  concept InfoEmitter = SingleLevelEmitter<E, Level::INFO>;
+
+  /*
+      Checks if Emitter will emit WARNING messages
+  */
+  export template <typename E>
+  concept WarningEmitter = SingleLevelEmitter<E, Level::WARNING>;
+
+  /*
+      Checks if Emitter will emit ERROR messages
+  */
+  export template <typename E>
+  concept ErrorEmitter = SingleLevelEmitter<E, Level::ERROR>;
+
+  /*
+      Checks if Emitter will emit FATAL messages
+  */
+  export template <typename E>
+  concept FatalEmitter = SingleLevelEmitter<E, Level::FATAL>;
+
+  /*
+    Emitters are compile time constructs with some runtime parts. This will allow a log to target
+    a file, the terminal, a specific stream, etc. An emitter is allowed to be
+    incomplete. In such a case where the emitter is incomplete, the function will still be callable
+    with no side effects. An emitter does not need to guarantee thread safety.
+    Even though the emit function takes a string as an argument. Emitters are encouraged to take
+    string_view as the argument unless string is really required as an argument.
+  */
+  export template <typename E>
+  concept Emitter =
+    DebugEmitter<E> && InfoEmitter<E> && WarningEmitter<E> && FatalEmitter<E> && ErrorEmitter<E>;
+
+  /*
+    Stream Emitter. Emits to a stream given by the input.
+  */
+  export struct StreamEmitter {
+    StreamEmitter(std::ostream &os = std::cout) : _os{os} {}
+    template <Level log_level> void emit(std::string_view v) const {
+      _os << v << "\n";
+    }
+
+  private:
+    // The stream to write to.
+    std::ostream &_os;
+  };
+  static_assert(Emitter<StreamEmitter>);
+
+  export struct FileEmitter {
+    FileEmitter(const std::filesystem::path &fpath) {
+      _file = fopen(fpath.c_str(), "w");
+      if (_file == nullptr) throw std::system_error{errno, std::generic_category()};
+    }
+    FileEmitter(const char *filename) {
+      _file = fopen(filename, "w");
+      if (_file == nullptr) throw std::system_error{errno, std::generic_category()};
+    }
+    FileEmitter(FileEmitter &&other_emitter) : _file{other_emitter._file} {
+      other_emitter._file = nullptr;
+    }
+    template <Level log_level> void emit(std::string_view v) const {
+      if (_file == nullptr) throw std::system_error{errno, std::generic_category()};
+      std::unique_lock l{_m};
+      fwrite(static_cast<const void *>(v.data()), sizeof(char), v.length(), _file);
+      char end_of_line = '\n';
+      fwrite(static_cast<const void *>(&end_of_line), sizeof(char), 1, _file);
+    }
+
+    ~FileEmitter() {
+      if (_file != nullptr) fclose(_file);
+    }
+
+  private:
+    mutable std::mutex _m;
+    FILE *_file;
+  };
+
+  /*
+    Filter Emitter. Emits the stream and filters out unneeded log levels.
+  */
+  export template <Emitter emitter_t> struct FilterEmitter {
+  public:
+    FilterEmitter(emitter_t emitter, Level min_level) :
+      _emitter{std::move(emitter)}, _min_level{min_level} {}
+    template <Level log_level>
+      requires(SingleLevelEmitter<emitter_t, log_level>)
+    void emit(std::string_view v) const {
+      if constexpr (log_level >= _min_level) {
+        _emitter.emit(v);
+      }
+    }
+    void set_level(Level level) {
+      _min_level = level;
+    }
+
+  private:
+    emitter_t _emitter;
+    Level _min_level;
+  };
+  static_assert(Emitter<FilterEmitter<StreamEmitter>>);
+
+  /*
+    Packs multiple emitter into one.
+  */
+  export template <Emitter... emitters>
+    requires(sizeof...(emitters) != 0)
+  struct EmitterPack {
+  public:
+    EmitterPack(emitters &&...emitter_pack) : _emitters{std::forward<emitters>(emitter_pack)...} {}
+    template <Level log_level> void emit(std::string_view v) const {
+      _emit<0, log_level>(v);
+    }
+    static constexpr size_t size() {
+      return sizeof...(emitters);
+    }
+
+  private:
+    std::tuple<emitters...> _emitters;
+
+    template <size_t id, Level log_level> void _emit(std::string_view v) const {
+      std::get<id>(_emitters).emit<log_level>(v);
+      if constexpr (id + 1 != size()) {
+        _emit<id + 1, log_level>(v);
+      }
+    }
+  };
+  static_assert(Emitter<EmitterPack<StreamEmitter, FilterEmitter<StreamEmitter>>>);
+};

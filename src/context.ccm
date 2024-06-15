@@ -1,0 +1,64 @@
+module;
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <concepts>
+#include <format>
+#include <source_location>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <type_traits>
+
+export module moderna.logging:context;
+namespace moderna::logging {
+
+  export enum class Level { DEBUG, INFO, WARNING, ERROR, FATAL };
+
+  /*
+    The context used for logging a message. When any logging function is called, this class will be
+    created to encapsulate the logged data. When used with std::formatter, it will format the
+    context to replace the correct data.
+  */
+  template <Level log_level> struct Context {
+    using clock_t = std::chrono::system_clock;
+    constexpr Context(std::string msg, std::source_location loc) :
+      _msg{std::move(msg)}, _call_location{std::move(loc)}, _call_time{clock_t::now()} {}
+
+    /*
+      the level of the logging.
+    */
+    static constexpr Level level() {
+      return log_level;
+    }
+    /*
+      For integrity reasons, the message should not be modifiable.
+    */
+    std::string_view message() const {
+      return _msg;
+    }
+    const std::thread::id &thread_id() const {
+      return _thread_id;
+    }
+    /*
+      Returns the location at which the logger is called. This allows printing the lines at
+      which the logger is called.
+    */
+    const std::source_location &call_location() const {
+      return _call_location;
+    }
+    /*
+      Get time
+    */
+    const clock_t::time_point &call_time() const {
+      return _call_time;
+    }
+
+  private:
+    std::string _msg;
+    std::source_location _call_location;
+    clock_t::time_point _call_time;
+    std::thread::id _thread_id;
+  };
+
+}

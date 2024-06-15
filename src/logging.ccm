@@ -1,0 +1,159 @@
+module;
+#include <memory>
+#include <mutex>
+#include <source_location>
+#include <tuple>
+#include <type_traits>
+
+export module moderna.logging;
+export import :emitter;
+export import :context;
+export import :formatter;
+export import :format_override;
+import moderna.thread_plus;
+
+namespace moderna::logging {
+  /*
+    Represents an Emitter Formatter Pack
+  */
+  export template <typename Pipe>
+  concept LogPipe = requires(const Pipe p) {
+    { p.template log(std::declval<const Context<Level::DEBUG> &>()) } -> std::same_as<void>;
+    { p.template log(std::declval<const Context<Level::ERROR> &>()) } -> std::same_as<void>;
+    { p.template log(std::declval<const Context<Level::FATAL> &>()) } -> std::same_as<void>;
+    { p.template log(std::declval<const Context<Level::INFO> &>()) } -> std::same_as<void>;
+    { p.template log(std::declval<const Context<Level::WARNING> &>()) } -> std::same_as<void>;
+  };
+  /*
+    Represents the default pipe.
+  */
+  export template <Emitter emitter_t, Formatter formatter_t>
+    requires(std::is_move_constructible_v<emitter_t> && std::is_move_constructible_v<formatter_t>)
+  struct DefaultPipe {
+  public:
+    DefaultPipe(emitter_t emitter, formatter_t formatter) :
+      _emitter{std::move(emitter)}, _formatter{std::move(formatter)} {}
+    template <Level log_level> void log(const Context<log_level> &ctx) const {
+      _emitter.template emit<log_level>(_formatter.format(ctx));
+    }
+
+  private:
+    emitter_t _emitter;
+    formatter_t _formatter;
+  };
+
+  /*
+    Logger
+  */
+  export template <typename L>
+  concept LogDispatcher = requires(const L &l) {
+    {
+      l.template log<Level::DEBUG>(
+        std::declval<std::string>(), std::declval<std::source_location>()
+      )
+    };
+    {
+      l.template log<Level::INFO>(std::declval<std::string>(), std::declval<std::source_location>())
+    };
+    {
+      l.template log<Level::WARNING>(
+        std::declval<std::string>(), std::declval<std::source_location>()
+      )
+    };
+    {
+      l.template log<Level::FATAL>(
+        std::declval<std::string>(), std::declval<std::source_location>()
+      )
+    };
+    {
+      l.template log<Level::ERROR>(
+        std::declval<std::string>(), std::declval<std::source_location>()
+      )
+    };
+  };
+
+  export template <LogPipe... Pipes>
+    requires(sizeof...(Pipes) != 0)
+  struct AsyncLogger {
+  public:
+    constexpr AsyncLogger(size_t num_of_worker, Pipes &&...pipes) :
+      _pipes{std::forward<Pipes>(pipes)...}, _worker{num_of_worker} {}
+    constexpr AsyncLogger(Pipes &&...pipes) : _pipes{std::forward<Pipes>(pipes)...}, _worker{1} {}
+    constexpr AsyncLogger(AsyncLogger &&logger) :
+      _pipes{std::forward<Pipes>(logger._pipes)...}, _worker{logger._worker.size()} {}
+
+    template <Level log_level> void log(std::string message, std::source_location loc) const {
+      auto ctx = std::make_shared<Context<log_level>>(std::move(message), std::move(loc));
+      _emit_all(ctx);
+    }
+    static constexpr size_t pipe_count() {
+      return sizeof...(Pipes);
+    }
+    ~AsyncLogger() {
+      if (_worker.joinable()) _worker.join();
+    }
+
+  private:
+    std::tuple<Pipes...> _pipes;
+    mutable thread_plus::pool::Pool _worker;
+
+    template <size_t id = 0, Level log_level>
+    constexpr void _emit_all(std::shared_ptr<Context<log_level>> ctx) const {
+      _worker.add_task([this, ctx]() { std::get<id>(_pipes).log(*ctx); });
+      if constexpr (id + 1 != pipe_count()) {
+        _emit_all<id + 1>(ctx);
+      }
+    }
+  };
+  static_assert(LogDispatcher<AsyncLogger<DefaultPipe<StreamEmitter, DefaultFormatter>>>);
+  export template <LogPipe... Pipes>
+    requires(sizeof...(Pipes) != 0)
+  struct SyncLogger {
+    constexpr SyncLogger(Pipes &&...pipes) : _pipes{std::forward<Pipes>(pipes)...} {}
+    constexpr SyncLogger(SyncLogger &&sync_logger) : _pipes{std::move(sync_logger._pipes)} {}
+    template <Level log_level> void log(std::string message, std::source_location loc) const {
+      auto ctx = Context<log_level>{std::move(message), std::move(loc)};
+      std::unique_lock l{_mut};
+      _emit_all(ctx);
+    }
+    static consteval size_t pipe_count() {
+      return sizeof...(Pipes);
+    }
+
+  private:
+    std::tuple<Pipes...> _pipes;
+    mutable std::mutex _mut;
+
+    template <size_t id = 0, Level log_level>
+    constexpr void _emit_all(const Context<log_level> &ctx) const {
+      std::get<id>(_pipes).log(ctx);
+      if constexpr (id + 1 != pipe_count()) {
+        _emit_all<id + 1>(ctx);
+      }
+    }
+  };
+  static_assert(LogDispatcher<SyncLogger<DefaultPipe<StreamEmitter, DefaultFormatter>>>);
+
+  export template <LogDispatcher logger_t> struct Logger {
+    template <typename... Args>
+    constexpr Logger(Args &&...args) : _logger{std::forward<Args>(args)...} {}
+    void debug(std::string message, std::source_location loc = std::source_location::current()) {
+      _logger.template log<Level::DEBUG>(std::move(message), loc);
+    }
+    void info(std::string message, std::source_location loc = std::source_location::current()) {
+      _logger.template log<Level::INFO>(std::move(message), loc);
+    }
+    void warn(std::string message, std::source_location loc = std::source_location::current()) {
+      _logger.template log<Level::WARNING>(std::move(message), loc);
+    }
+    void error(std::string message, std::source_location loc = std::source_location::current()) {
+      _logger.template log<Level::ERROR>(std::move(message), loc);
+    }
+    void fatal(std::string message, std::source_location loc = std::source_location::current()) {
+      _logger.template log<Level::FATAL>(std::move(message), loc);
+    }
+
+  private:
+    logger_t _logger;
+  };
+}
